@@ -85,7 +85,7 @@ class ManageIQ::Providers::Redhat::InfraManager < ManageIQ::Providers::InfraMana
     log_header = "EMS: [#{name}] #{vm.class.name}: id [#{vm.id}], name [#{vm.name}], ems_ref [#{vm.ems_ref}]"
     spec       = options[:spec]
 
-    vm.with_provider_object do |rhevm_vm|
+    vm.with_provider_object(:version => highest_allowed_api_version) do |rhevm_vm|
       _log.info("#{log_header} Started...")
       update_vm_memory(rhevm_vm, spec["memoryMB"] * 1.megabyte) if spec["memoryMB"]
 
@@ -93,7 +93,7 @@ class ManageIQ::Providers::Redhat::InfraManager < ManageIQ::Providers::InfraMana
       cpu_options[:cores]   = spec["numCoresPerSocket"] if spec["numCoresPerSocket"]
       cpu_options[:sockets] = spec["numCPUs"] / (cpu_options[:cores] || vm.cpu_cores_per_socket) if spec["numCPUs"]
 
-      rhevm_vm.cpu_topology = cpu_options if cpu_options.present?
+      rhevm_vm.update_cpu_topology!(cpu_options) if cpu_options.present?
     end
 
     # Removing disks
