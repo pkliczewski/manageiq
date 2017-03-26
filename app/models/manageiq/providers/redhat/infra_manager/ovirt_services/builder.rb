@@ -17,7 +17,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices
       connection = args[:connection]
       return new(ems).build if ems
       strategy_model = ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
-      api_version =  connection.kind_of?(OvirtSDK4::Connection) ? 4 : 3
+      api_version = connection.kind_of?(OvirtSDK4::Connection) ? 4 : 3
       "#{strategy_model}::V#{api_version}".constantize
     end
   end

@@ -1,5 +1,9 @@
+require 'ovirtsdk4'
+
 module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
   class V4
+    include Vmdb::Logging
+
     attr_reader :ext_management_system
 
     def initialize(args)
@@ -99,42 +103,38 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
     end
 
     def vm_boot_from_cdrom(operation, name)
-      begin
-        operation.get_provider_destination.vm_service.start(
-            vm: {
-                os: {
-                    boot: {
-                        devices: [
-                            OvirtSDK4::BootDevice::CDROM
-                        ]
-                    }
-                },
-                cdroms: [
-                    {
-                        id: name
-                    }
-                ]
+      operation.get_provider_destination.vm_service.start(
+        :vm => {
+          :os     => {
+            :boot => {
+              :devices => [OvirtSDK4::BootDevice::CDROM]
             }
-        )
-      rescue OvirtSDK4::Error
-        raise OvirtServices::VmNotReadyToBoot
-      end
+          },
+          :cdroms => [
+            {
+              :id => name
+            }
+          ]
+        }
+      )
+    rescue OvirtSDK4::Error
+      raise OvirtServices::VmNotReadyToBoot
     end
 
     def vm_boot_from_network(operation)
-      begin
-        operation.get_provider_destination.start(vm: {
-            os: {
-                boot: {
-                    devices: [
-                        OvirtSDK4::BootDevice::NETWORK
-                    ]
-                }
+      operation.get_provider_destination.start(
+        :vm => {
+          :os => {
+            :boot => {
+              :devices => [
+                OvirtSDK4::BootDevice::NETWORK
+              ]
             }
-        })
-      rescue OvirtSDK4::Error
-        raise OvirtServices::VmNotReadyToBoot
-      end
+          }
+        }
+      )
+    rescue OvirtSDK4::Error
+      raise OvirtServices::VmNotReadyToBoot
     end
 
     def get_template_proxy(template, connection)
@@ -192,6 +192,49 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def vm_suspend(vm)
       vm.with_provider_object(:version => 4, &:suspend)
+    end
+
+    def vm_reconfigure(vm, options = {})
+      log_header = "EMS: [#{ext_management_system.name}] #{vm.class.name}: id [#{vm.id}], name [#{vm.name}], ems_ref [#{vm.ems_ref}]"
+      spec = options[:spec]
+
+      _log.info("#{log_header} Started...")
+
+      vm.with_provider_object(:version => 4) do |vm_service|
+        # Retrieve the current representation of the virtual machine:
+        vm = vm_service.get
+
+        # Update the memory:
+        memory = spec['memoryMB']
+        update_vm_memory(vm, vm_service, memory.megabytes) if memory
+
+        # Update the CPU:
+        cpu_total = spec['numCPUs']
+        cpu_cores = spec['numCoresPerSocket']
+        cpu_sockets = cpu_total / (cpu_cores || vm.cpu.topology.cores) if cpu_total
+        if cpu_cores || cpu_sockets
+          vm_service.update(
+            OvirtSDK4::Vm.new(
+              :cpu => {
+                :topology => {
+                  :cores   => cpu_cores,
+                  :sockets => cpu_sockets
+                }
+              }
+            )
+          )
+        end
+
+        # Remove disks:
+        removed_disk_specs = spec['disksRemove']
+        remove_vm_disks(vm_service, removed_disk_specs) if removed_disk_specs
+
+        # Add disks:
+        added_disk_specs = spec['disksAdd']
+        add_vm_disks(vm_service, added_disk_specs) if added_disk_specs
+      end
+
+      _log.info("#{log_header} Completed.")
     end
 
     class VmProxyDecorator < SimpleDelegator
@@ -259,6 +302,13 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     private
 
+    #
+    # Hot plug of virtual memory has to be done in quanta of this size. Actually this is configurable in the
+    # engine, using the `HotPlugMemoryMultiplicationSizeMb` configuration parameter, but it is very unlikely
+    # that it will change.
+    #
+    HOT_PLUG_DIMM_SIZE = 256.megabyte.freeze
+
     def cluster_proxy_from_href(href, connection)
       connection.system_service.clusters_service.cluster_service(uuid_from_href(href)).get
     end
@@ -274,8 +324,161 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def network_profile_id(connection, network_id)
       profiles_service = connection.system_service.vnic_profiles_service
-      profile = profiles_service.list.detect{ |profile| profile.network.id == network_id }
+      profile = profiles_service.list.detect { |pr| pr.network.id == network_id }
       profile && profile.id
+    end
+
+    #
+    # Updates the amount memory of a virtual machine.
+    #
+    # @param vm [OvirtSDK4::Vm] The current representation of the virtual machine.
+    # @param vm_service [OvirtSDK4::VmService] The service that manages the virtual machine.
+    # @param memory [Integer] The new amount of memory requested by the user.
+    #
+    def update_vm_memory(vm, vm_service, memory)
+      # Calculate the adjusted virtual and guaranteed memory:
+      virtual = calculate_adjusted_virtual_memory(vm, memory)
+      guaranteed = calculate_adjusted_guaranteed_memory(vm, memory)
+
+      # If the virtual machine is running we need to update first the configuration that will be used during the
+      # next run, as the guaranteed memory can't be changed for the running virtual machine.
+      if vm.status == OvirtSDK4::VmStatus::UP
+        vm_service.update(
+          OvirtSDK4::Vm.new(
+            :memory        => virtual,
+            :memory_policy => {
+              :guaranteed => guaranteed
+            }
+          ),
+          :next_run => true
+        )
+        vm_service.update(
+          OvirtSDK4::Vm.new(
+            :memory => virtual
+          )
+        )
+      else
+        vm_service.update(
+          OvirtSDK4::Vm.new(
+            :memory        => virtual,
+            :memory_policy => {
+              :guaranteed => guaranteed
+            }
+          )
+        )
+      end
+    end
+
+    #
+    # Adjusts the new requested virtual memory of a virtual machine so that it satisfies the constraints imposed
+    # by the engine.
+    #
+    # @param vm [OvirtSDK4::Vm] The current representation of the virtual machine.
+    # @param memory [Integer] The new amount of memory requested by the user.
+    # @return [Integer] The amount of memory requested by the user adjusted so that it satisfies the constrains
+    #   imposed by the engine.
+    #
+    def calculate_adjusted_virtual_memory(vm, memory)
+      # Initially there is no need for adjustment:
+      adjusted = memory
+
+      # If the virtual machine is running then the difference in memory has to be a multiple of 256 MiB, otherwise
+      # the engine will not perform the hot plug of the new memory. The reason for this is that hot plugging of
+      # memory is performed adding a new virtual DIMM to the virtual machine, and the size of the virtual DIMM
+      # is 256 MiB. This means that we need to round the difference up to the closest multiple of 256 MiB.
+      if vm.status == OvirtSDK4::VmStatus::UP
+        delta = memory - vm.memory
+        remainder = delta % HOT_PLUG_DIMM_SIZE
+        if remainder > 0
+          adjustment = HOT_PLUG_DIMM_SIZE - remainder
+          adjusted = memory + adjustment
+          _log.info(
+            "The change in virtual memory of virtual machine '#{vm.name}' needs to be a multiple of " \
+            "#{HOT_PLUG_DIMM_SIZE / 1.megabyte} MiB, so it will be adjusted to #{adjusted / 1.megabyte} MiB."
+          )
+        end
+      end
+
+      # Return the adjusted memory:
+      adjusted
+    end
+
+    #
+    # Adjusts the guaranteed memory of a virtual machie so that it satisfies the constraints imposed by the
+    # engine.
+    #
+    # @param vm [OvirtSDK4::Vm] The current representation of the virtual machine.
+    # @param memory [Integer] The new amount of memory requested by the user (and maybe already adjusted).
+    # @return [Integer] The amount of guarantted memory to request so that it satisfies the constraints imposed by
+    #   the engine.
+    #
+    def calculate_adjusted_guaranteed_memory(vm, memory)
+      # Get the current amount of guaranteed memory:
+      current = vm.memory_policy.guaranteed
+
+      # Initially there is no need for adjustment:
+      adjusted = current
+
+      # The engine requires that the virtual memory is bigger or equal than the guaranteed memory at any given
+      # time. Therefore, we need to adjust the guaranteed memory so that it is the minimum of the previous
+      # guaranteed memory and the new virtual memory.
+      if current > memory
+        adjusted = memory
+        _log.info(
+          "The guaranteed physical memory of virtual machine '#{vm.name}' needs to be less or equal than the " \
+          "virtual memory, so it will be adjusted to #{adjusted / 1.megabyte} MiB."
+        )
+      end
+
+      # Return the adjusted guaranteed memory:
+      adjusted
+    end
+
+    #
+    # Adds disks to a virtual machine.
+    #
+    # @param vm_service [OvirtSDK4::VmsService] The service that manages the virtual machine.
+    # @param disk_specs [Hash] The specification of the disks to add.
+    #
+    def add_vm_disks(vm_service, disk_specs)
+      storage_spec = disk_specs[:storage]
+      attachments_service = vm_service.disk_attachments_service
+      disk_specs[:disks].each do |disk_spec|
+        attachment = prepare_vm_disk_attachment(disk_spec, storage_spec)
+        attachments_service.add(attachment)
+      end
+    end
+
+    #
+    # Prepares a disk attachment for adding a new disk to a virtual machine.
+    #
+    # @param disk_spec [Hash] The specification of the disk to add.
+    # @param storage_spec [Hash] The specification of the storage to use.
+    #
+    def prepare_vm_disk_attachment(disk_spec, storage_spec)
+      disk_spec = disk_spec.symbolize_keys
+      attachment_builder = ManageIQ::Providers::Redhat::InfraManager::DiskAttachmentBuilder.new(
+        :size_in_mb       => disk_spec[:disk_size_in_mb],
+        :storage          => storage_spec,
+        :name             => disk_spec[:disk_name],
+        :thin_provisioned => disk_spec[:thin_provisioned],
+        :bootable         => disk_spec[:bootable],
+      )
+      attachment_builder.disk_attachment
+    end
+
+    #
+    # Removes disks from a virtual machine.
+    #
+    # @param vm_service [OvirtSDK4::VmsService] The service that manages the virtual machine.
+    # @param disk_specs [Array<Hash>] The specifications of the disks to remove.
+    #
+    def remove_vm_disks(vm_service, disk_specs)
+      attachments_service = vm_service.disk_attachments_service
+      disk_specs.each do |disk_spec|
+        attachment_service = attachments_service.attachment_service(disk_spec['disk_name'])
+        attachment_service.remove(:detach_only => !disk_spec['delete_backing'])
+      end
     end
   end
 end

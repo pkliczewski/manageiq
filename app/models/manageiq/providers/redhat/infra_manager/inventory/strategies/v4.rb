@@ -87,6 +87,8 @@ module ManageIQ::Providers::Redhat::InfraManager::Inventory::Strategies
     def collect_vm_by_uuid(uuid)
       vm = connection.system_service.vms_service.vm_service(uuid).get
       [VmPreloadedAttributesDecorator.new(vm, connection)]
+    rescue OvirtSDK4::Error
+      []
     end
 
     def collect_templates
@@ -128,7 +130,7 @@ module ManageIQ::Providers::Redhat::InfraManager::Inventory::Strategies
       def initialize(host, connection)
         @obj = host
         @nics = connection.follow_link(host.nics)
-        @statistics = connection.follow_link(host.statistics)
+        @statistics = connection.link?(host.statistics) ? connection.follow_link(host.statistics) : host.statistics
         super(host)
       end
     end

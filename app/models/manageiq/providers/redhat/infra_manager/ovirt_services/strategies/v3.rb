@@ -1,5 +1,7 @@
 module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
   class V3
+    include Vmdb::Logging
+
     attr_reader :ext_management_system
 
     def initialize(args)
@@ -105,19 +107,15 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
     end
 
     def vm_boot_from_cdrom(operation, name)
-      begin
-        operation.get_provider_destination.boot_from_cdrom(name)
-      rescue Ovirt::VmNotReadyToBoot
-        raise OvirtServices::VmNotReadyToBoot
-      end
+      operation.get_provider_destination.boot_from_cdrom(name)
+    rescue Ovirt::VmNotReadyToBoot
+      raise OvirtServices::VmNotReadyToBoot
     end
 
     def vm_boot_from_network(operation)
-      begin
-        operation.get_provider_destination.boot_from_network
-      rescue Ovirt::VmNotReadyToBoot
-        raise OvirtServices::VmNotReadyToBoot
-      end
+      operation.get_provider_destination.boot_from_network
+    rescue Ovirt::VmNotReadyToBoot
+      raise OvirtServices::VmNotReadyToBoot
     end
 
     def get_template_proxy(template, connection)
@@ -149,7 +147,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def shutdown_guest(operation)
       operation.with_provider_object(&:shutdown)
-      rescue Ovirt::VmIsNotRunning
+    rescue Ovirt::VmIsNotRunning
     end
 
     def start_clone(source, clone_options, phase_context)
@@ -163,16 +161,35 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
       vm.with_provider_object do |rhevm_vm|
         rhevm_vm.start { |action| action.use_cloud_init(true) if cloud_init }
       end
-      rescue Ovirt::VmAlreadyRunning
+    rescue Ovirt::VmAlreadyRunning
     end
 
     def vm_stop(vm)
       vm.with_provider_object(&:stop)
-      rescue Ovirt::VmIsNotRunning
+    rescue Ovirt::VmIsNotRunning
     end
 
     def vm_suspend(vm)
       vm.with_provider_object(&:suspend)
+    end
+
+    def vm_reconfigure(vm, options = {})
+      log_header = "EMS: [#{ext_management_system.name}] #{vm.class.name}: id [#{vm.id}], name [#{vm.name}], ems_ref [#{vm.ems_ref}]"
+      spec = options[:spec]
+
+      _log.info("#{log_header} Started...")
+
+      vm.with_provider_object do |rhevm_vm|
+        update_vm_memory(rhevm_vm, spec["memoryMB"] * 1.megabyte) if spec["memoryMB"]
+
+        cpu_options = {}
+        cpu_options[:cores] = spec["numCoresPerSocket"] if spec["numCoresPerSocket"]
+        cpu_options[:sockets] = spec["numCPUs"] / (cpu_options[:cores] || vm.cpu_cores_per_socket) if spec["numCPUs"]
+
+        rhevm_vm.cpu_topology = cpu_options if cpu_options.present?
+      end
+
+      _log.info("#{log_header} Completed.")
     end
 
     class NicsDecorator < SimpleDelegator
@@ -190,7 +207,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
       def method_missing(method_name, *args)
         str_method_name = method_name.to_s
         if str_method_name =~ /update_.*!/
-          attribute_to_update = str_method_name.split("update_")[1].gsub('!','')
+          attribute_to_update = str_method_name.split("update_")[1].delete('!')
           send("#{attribute_to_update}=", *args)
         else
           # This is requied becasue of Ovirt::Vm strage behaviour - while rhevm.respond_to?(:nics)
@@ -202,6 +219,108 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
           end
         end
       end
+    end
+
+    private
+
+    #
+    # Hot plug of virtual memory has to be done in quanta of this size. Actually this is configurable in the
+    # engine, using the `HotPlugMemoryMultiplicationSizeMb` configuration parameter, but it is very unlikely
+    # that it will change.
+    #
+    HOT_PLUG_DIMM_SIZE = 256.megabyte.freeze
+
+    def update_vm_memory(vm, virtual)
+      # Adjust the virtual and guaranteed memory:
+      virtual = calculate_adjusted_virtual_memory(vm, virtual)
+      guaranteed = calculate_adjusted_guaranteed_memory(vm, virtual)
+
+      # If the virtual machine is running we need to update first the configuration that will be used during the
+      # next run, as the guaranteed memory can't be changed for the running virtual machine.
+      state = vm.attributes.fetch_path(:status, :state)
+      if state == 'up'
+        vm.update_memory(virtual, guaranteed, :next_run => true)
+        vm.update_memory(virtual, nil)
+      else
+        vm.update_memory(virtual, guaranteed)
+      end
+    end
+
+    #
+    # Adjusts the new requested virtual memory of a virtual machine so that it satisfies the constraints imposed
+    # by the engine.
+    #
+    # @param vm [Hash] The current representation of the virtual machine.
+    #
+    # @param requested [Integer] The new amount of virtual memory requested by the user.
+    #
+    # @return [Integer] The amount of virtual memory requested by the user adjusted so that it satisfies the constrains
+    #   imposed by the engine.
+    #
+    def calculate_adjusted_virtual_memory(vm, requested)
+      # Get the current state of the virtual machine, and the current amount of virtual memory:
+      attributes = vm.attributes
+      name = attributes.fetch_path(:name)
+      state = attributes.fetch_path(:status, :state)
+      current = attributes.fetch_path(:memory)
+
+      # Initially there is no need for adjustment:
+      adjusted = requested
+
+      # If the virtual machine is running then the difference in memory has to be a multiple of 256 MiB, otherwise
+      # the engine will not perform the hot plug of the new memory. The reason for this is that hot plugging of
+      # memory is performed adding a new virtual DIMM to the virtual machine, and the size of the virtual DIMM
+      # is 256 MiB. This means that we need to round the difference up to the closest multiple of 256 MiB.
+      if state == 'up'
+        delta = requested - current
+        remainder = delta % HOT_PLUG_DIMM_SIZE
+        if remainder > 0
+          adjustment = HOT_PLUG_DIMM_SIZE - remainder
+          adjusted = requested + adjustment
+          _log.info(
+            "The change in virtual memory of virtual machine '#{name}' needs to be a multiple of " \
+            "#{HOT_PLUG_DIMM_SIZE / 1.megabyte} MiB, so it will be adjusted to #{adjusted / 1.megabyte} MiB."
+          )
+        end
+      end
+
+      # Return the adjusted memory:
+      adjusted
+    end
+
+    #
+    # Adjusts the guaranteed memory of a virtual machie so that it satisfies the constraints imposed by the
+    # engine.
+    #
+    # @param vm [Hash] The current representation of the virtual machine.
+    #
+    # @param virtual [Integer] The new amount of virtual memory requested by the user (and maybe already adjusted).
+    #
+    # @return [Integer] The amount of guarantted memory to request so that it satisfies the constraints imposed by
+    #   the engine.
+    #
+    def calculate_adjusted_guaranteed_memory(vm, virtual)
+      # Get the current amount of guaranteed memory:
+      attributes = vm.attributes
+      name = attributes.fetch_path(:name)
+      current = attributes.fetch_path(:memory_policy, :guaranteed)
+
+      # Initially there is no need for adjustment:
+      adjusted = current
+
+      # The engine requires that the virtual memory is bigger or equal than the guaranteed memory at any given
+      # time. Therefore, we need to adjust the guaranteed memory so that it is the minimum of the previous
+      # guaranteed memory and the new virtual memory.
+      if current > virtual
+        adjusted = virtual
+        _log.info(
+          "The guaranteed physical memory of virtual machine '#{name}' needs to be less or equal than the virtual " \
+          "memory, so it will be adjusted to #{adjusted / 1.megabyte} MiB."
+        )
+      end
+
+      # Return the adjusted guaranteed memory:
+      adjusted
     end
   end
 end
