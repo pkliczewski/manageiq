@@ -2,7 +2,7 @@ module ManageIQ::Providers::Redhat::InfraManager::Refresh::Strategies
   class Api3 < ManageIQ::Providers::Redhat::InfraManager::Refresh::Refresher
     def host_targeted_refresh(inventory, target)
       methods = {
-        :primary => {
+        :primary   => {
           :host    => target.ems_ref,
           :network => { :networks => "network" }
         },

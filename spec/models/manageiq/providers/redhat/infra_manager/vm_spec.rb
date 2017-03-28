@@ -121,7 +121,7 @@ describe ManageIQ::Providers::Redhat::InfraManager::Vm do
       ems = FactoryGirl.create(:ems_redhat, :zone => zone, :hostname => ip_address,
                                :ipaddress => ip_address, :port => 8443)
       ems.update_authentication(:default => {:userid => "admin@internal", :password => "engine"})
-      #TODO: (inventory) resvisit this test and write one for V4
+      # TODO: (inventory) resvisit this test and write one for V4
       allow(ems).to receive(:supported_api_versions).and_return([3])
       allow(ems).to receive(:resolve_ip_address).with(ip_address).and_return(ip_address)
 

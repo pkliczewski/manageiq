@@ -32,7 +32,7 @@ class ManageIQ::Providers::Redhat::InfraManager::Vm < ManageIQ::Providers::Infra
 
   def provider_object(connection = nil)
     ovirt_services_class = ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Builder
-      .build_from_ems_or_connection(:ems => ext_management_system, :connection => connection)
+                           .build_from_ems_or_connection(:ems => ext_management_system, :connection => connection)
     ovirt_services_class.new(:ems => ext_management_system).get_vm_proxy(self, connection)
   end
 
@@ -44,8 +44,8 @@ class ManageIQ::Providers::Redhat::InfraManager::Vm < ManageIQ::Providers::Infra
     rp = parent_resource_pool
     rp && rp.detect_ancestor(:of_type => "EmsCluster").first
   end
-  alias_method :owning_cluster, :parent_cluster
-  alias_method :ems_cluster, :parent_cluster
+  alias owning_cluster parent_cluster
+  alias ems_cluster parent_cluster
 
   def disconnect_storage(_s = nil)
     unless active?

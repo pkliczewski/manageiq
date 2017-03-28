@@ -1,7 +1,7 @@
 module ManageIQ::Providers::Redhat::InfraManager::Provision::Configuration::Network
   def configure_network_adapters
     configure_dialog_nic
-    requested_vnics   = options[:networks]
+    requested_vnics = options[:networks]
 
     if requested_vnics.nil?
       _log.info "NIC settings will be inherited from the template."
@@ -34,7 +34,7 @@ module ManageIQ::Providers::Redhat::InfraManager::Provision::Configuration::Netw
 
   def destination_vnics
     # Nics are not always ordered in the XML response
-    @destination_vnics ||= nics.sort_by { |n| n.name }
+    @destination_vnics ||= nics.sort_by(&:name)
   end
 
   def find_network_in_cluster(network_name)

@@ -80,11 +80,11 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
         profile_id = network_profile_id(connection, network.id)
         nics_service = connection.system_service.vms_service.vm_service(uuid).nics_service
         options = {
-                    :name         => nic_name || vnic.name,
-                    :interface    => interface || vnic.interface,
-                    :mac          => mac_addr ? OvirtSDK4::Mac.new({:address => mac_addr}) : vnic.mac,
-                    :vnic_profile => profile_id ? { id: profile_id } : vnic.vnic_profile
-                  }
+          :name         => nic_name || vnic.name,
+          :interface    => interface || vnic.interface,
+          :mac          => mac_addr ? OvirtSDK4::Mac.new(:address => mac_addr) : vnic.mac,
+          :vnic_profile => profile_id ? { :id => profile_id } : vnic.vnic_profile
+        }
         logger.info("with options: <#{options.inspect}>")
         if vnic
           nics_service.nic_service(vnic.id).update(options)
@@ -166,7 +166,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def shutdown_guest(operation)
       operation.with_provider_object(:version => 4, &:shutdown)
-      rescue OvirtSDK4::Error
+    rescue OvirtSDK4::Error
     end
 
     def start_clone(source, clone_options, phase_context)
@@ -187,7 +187,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def vm_stop(vm)
       vm.with_provider_object(:version => 4, &:stop)
-      rescue OvirtSDK4::Error
+    rescue OvirtSDK4::Error
     end
 
     def vm_suspend(vm)
@@ -290,9 +290,9 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
       end
 
       def build_vm_from_hash(args)
-        OvirtSDK4::Vm.new(:name => args[:name],
+        OvirtSDK4::Vm.new(:name     => args[:name],
                           :template => args[:template],
-                          :cluster => args[:cluster])
+                          :cluster  => args[:cluster])
       end
     end
 
