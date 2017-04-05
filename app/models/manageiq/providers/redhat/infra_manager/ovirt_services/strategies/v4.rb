@@ -146,12 +146,12 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
     end
 
     def get_vm_proxy(vm, connection)
-      VmProxyDecorator.new(connection.system_service.vms_service.vm_service(vm.uid_ems))
+      VmProxyDecorator.new(connection.system_service.vms_service.vm_service(vm.uid_ems), self)
     end
 
     def collect_disks_by_hrefs(disks)
       vm_disks = []
-      @ems.with_provider_connection(:version => 4) do |connection|
+      ext_management_system.with_provider_connection(:version => 4) do |connection|
         disks.each do |disk|
           parts = URI(disk).path.split('/')
           begin
@@ -238,6 +238,13 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
     end
 
     class VmProxyDecorator < SimpleDelegator
+      attr_reader :service
+      def initialize(vm, service)
+        @obj = vm
+        @service = service
+        super(vm)
+      end
+
       def update_memory_reserve!(memory_reserve_size)
         vm = get
         vm.memory_policy.guaranteed = memory_reserve_size
@@ -258,8 +265,7 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
       def update_host_affinity!(dest_host_ems_ref)
         vm = get
-        host = collect_host(dest_host_ems_ref)
-        vm.placement_policy.hosts = [host]
+        vm.placement_policy.hosts = [ OvirtSDK4::Host.new(id: service.uuid_from_href(dest_host_ems_ref)) ]
         update(vm)
       end
 
@@ -300,6 +306,10 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
       connection.system_service.clusters_service.cluster_service(uuid_from_href(href)).get
     end
 
+    def uuid_from_href(ems_ref)
+      URI(ems_ref).path.split('/').last
+    end
+
     private
 
     #
@@ -311,10 +321,6 @@ module ManageIQ::Providers::Redhat::InfraManager::OvirtServices::Strategies
 
     def cluster_proxy_from_href(href, connection)
       connection.system_service.clusters_service.cluster_service(uuid_from_href(href)).get
-    end
-
-    def uuid_from_href(ems_ref)
-      URI(ems_ref).path.split('/').last
     end
 
     def vm_service_by_href(href, connection)

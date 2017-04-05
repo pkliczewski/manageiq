@@ -64,6 +64,9 @@ class ManageIQ::Providers::Redhat::InfraManager::Vm < ManageIQ::Providers::Infra
   end
 
   def collect_disks
+    if hardware.nil?
+      return []
+    end
     disks = hardware.disks.map { |disk| "#{disk.storage.ems_ref}/disks/#{disk.filename}" }
     ext_management_system.ovirt_services.collect_disks_by_hrefs(disks)
   end
